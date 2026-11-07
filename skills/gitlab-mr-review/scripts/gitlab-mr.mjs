@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // GitLab MR helper for the gitlab-mr-review skill. Node 18+, no dependencies.
 //   prepare  --project <path|id> --mr <iid> [--repo <dir>] [--url <gitlab>]
-//   publish  --project <path|id> --mr <iid> --findings <file.json> --head <sha> [--url <gitlab>]
+//   publish  --project <path|id> --mr <iid> --findings <file.json> --head <sha> [--url <gitlab>] [--language fa|en]
 //   selftest
 // Token is read from GITLAB_TOKEN only (never pass it on the command line).
 import { execFileSync } from 'node:child_process';
@@ -57,13 +57,16 @@ export function parseFindings(text) {
   return [].concat(JSON.parse(t) ?? []).filter((f) => f && f.file);
 }
 
-const BADGE = { Critical: '🔴 Critical', High: '🟠 High', Medium: '🟡 Medium', Low: '🔵 Low' };
+const BADGE = { Critical: '🔴 Critical', High: '🟠 High', Medium: '🟡 Medium', Low: '🔵 Low', Improvement: '🔧 Improvement' };
 
-function findingBody(f) {
+function findingBody(f, language = 'fa') {
   const lines = [`**${BADGE[f.severity] ?? '⚪ Info'}**`, ''];
-  if (f.comment) lines.push('**یافته:**', String(f.comment));
-  if (f.solution) lines.push('', '**راه‌حل:**', String(f.solution));
-  if (!f.comment && !f.solution) lines.push('_بدون توضیح_');
+  const labels = language === 'en'
+    ? { finding: 'Finding', solution: 'Suggested solution', empty: '_No description_' }
+    : { finding: 'یافته', solution: 'راه‌حل', empty: '_بدون توضیح_' };
+  if (f.comment) lines.push(`**${labels.finding}:**`, String(f.comment));
+  if (f.solution) lines.push('', `**${labels.solution}:**`, String(f.solution));
+  if (!f.comment && !f.solution) lines.push(labels.empty);
   return lines.join('\n');
 }
 
@@ -91,6 +94,7 @@ const { positionals: [cmd], values: opt } = parseArgs({
     findings: { type: 'string' },
     head: { type: 'string' },
     only: { type: 'string' },
+    language: { type: 'string', default: 'fa' },
     interactive: { type: 'boolean', default: false },
   },
 });
@@ -103,6 +107,7 @@ if (!token) die('GITLAB_TOKEN environment variable is not set.');
 if (!opt.url) die('GitLab URL missing: pass --url or set GITLAB_URL.');
 if (!opt.project) die('--project is required.');
 if (!/^\d+$/.test(opt.mr ?? '')) die('--mr must be the numeric merge request IID.');
+if (opt.language !== 'fa' && opt.language !== 'en') die('--language must be fa or en.');
 
 const mrPath = `${opt.url.replace(/\/+$/, '')}/api/v4/projects/${encodeURIComponent(opt.project)}/merge_requests/${opt.mr}`;
 
@@ -136,11 +141,23 @@ if (cmd === 'prepare') {
     try { git(root, 'cat-file', '-e', `${sha}^{commit}`); } catch { die(`Commit ${sha} is not available locally after fetch.`); }
   }
   const rules = join(root, 'agent.md');
+  const [notes, discussions] = await Promise.all([
+    gl('GET', `${mrPath}/notes?per_page=100`).catch(() => []),
+    gl('GET', `${mrPath}/discussions?per_page=100`).catch(() => []),
+  ]);
+  const review_context = {
+    notes: (notes ?? []).filter((n) => !n.system).map(({ id, author, body, created_at }) => ({ id, author: author?.username, body, created_at })),
+    discussions: (discussions ?? []).map((d) => ({
+      id: d.id,
+      notes: (d.notes ?? []).filter((n) => !n.system).map(({ id, author, body, created_at, resolved }) => ({ id, author: author?.username, body, created_at, resolved })),
+    })),
+  };
   console.log(JSON.stringify({
     title: mr.title, web_url: mr.web_url,
     source_branch: mr.source_branch, target_branch: mr.target_branch,
     base_sha, head_sha, start_sha, repo_root: root,
     rules_file: existsSync(rules) ? rules : null,
+    review_context,
     diff_command: `git diff ${base_sha} ${head_sha}`,
     show_command: `git show ${head_sha}:<path>`,
   }, null, 2));
@@ -193,7 +210,7 @@ const unanchored = [];
 for (const f of findings) {
   const line = parseInt(f.line, 10) || 0;
   const label = `${f.file}:${line}`;
-  const body = findingBody(f);
+  const body = findingBody(f, opt.language);
   const path = resolvePath(String(f.file), known);
   // "line" is a NEW-file line; never map it onto the old side (that is unrelated code).
   if (path && files[path].map.has(line)) {

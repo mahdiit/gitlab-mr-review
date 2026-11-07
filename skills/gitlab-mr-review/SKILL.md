@@ -1,94 +1,111 @@
 ---
 name: gitlab-mr-review
-description: Review a GitLab merge request as a senior .NET/C# code reviewer and publish only user-approved inline MR discussions. Use when the user asks to review a GitLab MR / merge request, gives an MR number or URL, or says "review MR !123". Checks bugs, actionable improvements, EF Core/SQL query performance, DI dependency graphs and registrations, async/security/API correctness, and appropriate sealed classes.
+description: Review a GitLab merge request as a senior .NET/C# code reviewer, include existing MR discussion context, classify every actionable finding, and let the user choose one-by-one GitLab publication or a Markdown report in Persian or English.
 ---
 
 # GitLab MR Review
 
-You are the reviewer. A helper script talks to GitLab and git; you do the review in between.
-Script: `scripts/gitlab-mr.mjs` in this skill's directory (call it `$SKILL`). Requires Node 18+ and git.
+You are the reviewer. Use `scripts/gitlab-mr.mjs` (`$SKILL`) for GitLab and git setup. Requires Node 18+ and git.
 
-## 1. Gather inputs
+## Mandatory workflow
 
-- **GitLab URL**: `GITLAB_URL` env var, else ask (e.g. `https://gitlab.company.com`).
-- **Project**: path or ID (e.g. `group/project`). Infer from an MR URL or `git remote get-url origin` if possible.
-- **MR IID**: the number after `!` / `/merge_requests/`.
-- **Repo path**: local clone of the project, default the current directory.
-- **Token**: must be in the `GITLAB_TOKEN` env var. If it is missing, ask the user to set it in their shell. Never print the token, pass it as an argument, or write it to any file.
+### 1. Get the MR and its context
 
-## 2. Prepare
+Resolve `GITLAB_URL`, project, MR IID, local repo, and `GITLAB_TOKEN` from the environment or the user's MR URL. If the token is missing, ask the user to set it in their shell; never print, pass, or save it.
+
+Run:
 
 ```bash
 node $SKILL/scripts/gitlab-mr.mjs prepare --url <url> --project <project> --mr <iid> --repo <repo>
 ```
 
-Loads the MR, checks the working tree is clean, fetches the target branch and MR head, and verifies the commits exist.
-On error, show it to the user and stop. On success it prints JSON with `base_sha`, `head_sha`, `repo_root`, `rules_file`, `diff_command`, `show_command`. Keep `head_sha` for step 5.
+Stop on any error. Keep `base_sha`, `head_sha`, `start_sha`, `repo_root`, and `rules_file`. The result includes `review_context` with existing non-system MR notes and discussion comments; read it before reviewing and use relevant unresolved comments as review context, not as new findings by default.
 
-## 3. Review
+If `rules_file` is not null, read it. Project rules override this skill's defaults.
 
-## 3. Review
+### 2. Review the complete change
 
-The working tree may NOT be on the MR branch. Use git only, from `repo_root`:
-- MR diff: `git diff <base_sha> <head_sha>`
-- File contents: `git show <head_sha>:<path>`
+Review only changes introduced by this MR, using:
 
-If `rules_file` is not null, read it: those are the project's review rules and they take priority over the defaults below.
+```bash
+git diff <base_sha> <head_sha>
+git show <head_sha>:<path>
+```
 
-Review ONLY changes introduced by this MR. Read surrounding code when needed to confirm a finding. Report only actionable, high-confidence issues; do not report praise, formatting, or issues a compiler/linter should catch.
+Read surrounding code and all relevant callers before deciding. Check the whole changed code for correctness, security, nullability, boundaries, state transitions, exceptions, cancellation, async/disposal, races, compatibility, authorization, validation/injection/secrets/tenant isolation, EF Core and SQL query shape, DI registrations/lifetimes/cycles, API behavior, measurable performance waste, maintainability, and material simplifications. Check tests and configuration touched by the MR. Do not report praise, formatting, compiler/linter issues, speculative concerns, or style-only preferences.
 
-Default .NET review checklist:
-- Correctness: nullability, boundary conditions, state transitions, exception behavior, cancellation, async/await misuse, disposal, race conditions, and API/backward compatibility.
-- Security: authorization at the resource boundary, validation, injection, secrets, unsafe deserialization, sensitive data leakage, and tenant isolation.
-- EF Core/SQL: N+1 queries, accidental client evaluation, missing `AsNoTracking` on read-only queries, loading whole entities when projection is enough, premature `ToList`, repeated round trips, unbounded result sets, missing pagination, incorrect `Include`, non-sargable predicates, transaction/deadlock risks, and queries that cannot use an index. Prefer one simple, parameterized, set-based query when semantics allow it; do not suggest speculative indexes without evidence from the query shape.
-- DI/dependency graph: missing registrations, wrong lifetime (especially singleton → scoped), captive dependencies, service-locator usage, circular dependencies, unnecessary abstractions, and constructors with too many unrelated dependencies. Check that new services are registered in the composition root and that the graph can be built.
-- Design: classes that are not intended for inheritance should be `sealed`; avoid adding interfaces/factories without a real second implementation or test seam. Treat this as an improvement only when it prevents a real maintenance or correctness problem, not as a style-only comment.
-- Maintainability/performance: prefer the smallest safe fix, reuse existing helpers, and flag complexity only when it can cause bugs or measurable waste.
+Every finding must be actionable and high-confidence, and must include:
 
-For every finding, include the root cause, why the current code fails, and a concrete minimal fix. Suggestions are allowed when they materially improve correctness, performance, security, or maintainability; clearly label lower-severity improvements so they do not masquerade as bugs.
+- root cause;
+- why the current code fails or creates material risk;
+- the smallest concrete fix;
+- repository-relative `file` using forward slashes;
+- `line` from the NEW file version, on an added or context line in the MR diff.
 
-## 4. Write findings
+Classify every finding with exactly one category: `Critical`, `High`, `Medium`, `Low`, or `Improvement`. `Improvement` is for a material quality/performance/maintainability improvement that is not a defect; never use it for a style-only suggestion.
 
-Write a JSON array to a temp file **outside the repo** (e.g. `<os-temp>/mr-<iid>-findings.json`):
+### 3. Ask how to deliver findings
+
+After the complete review, do not publish or write a report yet. Ask the user two choices:
+
+1. **Review findings one by one and optionally publish each to GitLab** (recommended).
+2. **Write all findings to a Markdown file in the repository root**.
+
+For the Markdown option, ask for the report language: **Persian** or **English**. Use a sensible default only if the user explicitly delegates the choice. The report filename should be `MR-<iid>-REVIEW.md` unless the user chooses another name.
+
+For one-by-one review, show only the current finding's category, file/line, finding, and solution. Ask whether to publish it to GitLab, skip it, or stop. Never publish without explicit approval. Continue until all findings are handled. If the user asks to publish selected findings instead, show a numbered compact list and publish only the numbers they explicitly select.
+
+### 4A. Write a Markdown report
+
+Write the selected language in the repository root. Include every finding, grouped in this order:
+
+1. Critical
+2. High
+3. Medium
+4. Low
+5. Improvement
+
+Each entry must contain:
+
+```markdown
+### [Category] — `path/to/file.ext:123`
+
+**Finding:** ...
+
+**Solution:** ...
+```
+
+Use the actual NEW-file line. If there are no findings, write a short report stating that no actionable findings were found. Do not modify the MR source code. Tell the user the exact report path.
+
+### 4B. Publish approved findings to GitLab
+
+First write a JSON array outside the repository, for example `<os-temp>/mr-<iid>-findings.json`:
 
 ```json
 [
   {
     "file": "path/to/file.ext",
     "line": 123,
-    "severity": "Critical|High|Medium|Low",
-    "comment": "توضیح مشکل (یافته) به زبان فارسی",
-    "solution": "راه‌حل پیشنهادی برای رفع مشکل به زبان فارسی"
+    "severity": "Critical|High|Medium|Low|Improvement",
+    "comment": "Finding in the selected language",
+    "solution": "Concrete minimal solution in the selected language"
   }
 ]
 ```
 
-Rules:
-- `file`: repository-relative path with forward slashes, exactly as in the diff.
-- `line`: line number in the NEW version of the file (`git show <head_sha>:<path>`), and it MUST be an added or context line in the MR diff. Never invent line numbers.
-- `comment` and `solution`: written entirely in **Persian (Farsi)**. `comment` explains the finding precisely; `solution` gives a concrete, actionable fix (code is allowed).
-- No issues → `[]`.
-
-## 5. Confirm, then publish selectively
-
-Do not dump every finding and ask for one blanket approval. Let the user control publication:
-
-1. Number findings internally in the order written.
-2. Offer two choices: **review one-by-one** (recommended) or **select finding numbers** (for example `1,3`).
-3. For one-by-one approval, show only the current finding's severity, file/line, Persian comment, and solution; ask whether to publish it, skip it, or stop. Do not publish until the user explicitly approves that finding.
-4. For selective approval, show the numbered compact list, ask for the numbers, and publish only those selected.
-5. If the user chooses one-by-one, run:
+Run only after explicit approval:
 
 ```bash
-node $SKILL/scripts/gitlab-mr.mjs publish --url <url> --project <project> --mr <iid> --findings <file> --head <head_sha> --interactive
+node $SKILL/scripts/gitlab-mr.mjs publish --url <url> --project <project> --mr <iid> --findings <file> --head <head_sha> --language fa|en --only 1,3
 ```
 
-For a preselected set, run:
+For one-by-one approval, `--interactive` is allowed only after the user selected that mode and the helper's prompts match the already shown findings. Never use `--only` or `--interactive` as a substitute for approval. If the MR has new commits, stop and restart at step 1. Report inline, general, and failed counts, plus skipped findings. If none are approved, do not call GitLab.
 
-```bash
-node $SKILL/scripts/gitlab-mr.mjs publish --url <url> --project <project> --mr <iid> --findings <file> --head <head_sha> --only 1,3
-```
+## Default .NET checklist
 
-Never use `--interactive` or `--only` as a substitute for user approval. If the user approves none, do not call GitLab. The publisher posts each selected finding as an inline discussion, falls back to a general MR note when the line is not in the diff, and posts a summary only for selected findings. If it says the MR has new commits, stop and re-run from step 2.
-
-Report final counts (inline / general / failed) and list skipped findings locally; do not post skipped findings.
+- Correctness: nullability, boundaries, state, exceptions, cancellation, async/await, disposal, races, compatibility.
+- Security: authorization at the resource boundary, validation, injection, secrets, unsafe deserialization, sensitive-data leakage, tenant isolation.
+- EF Core/SQL: N+1, client evaluation, missing `AsNoTracking` for read-only queries, over-fetching, premature materialization, repeated round trips, unbounded results, pagination, `Include`, non-sargable predicates, transaction/deadlock risks, and query/index mismatch.
+- DI: missing registrations, wrong lifetimes, captive dependencies, service locator, cycles, unnecessary abstractions, and overly coupled constructors.
+- Design: mark classes `sealed` only when it materially prevents a maintenance problem; do not report style-only sealing or speculative abstractions.
+- Maintainability/performance: prefer the smallest safe fix and existing helpers; report complexity only when it can cause bugs or measurable waste.
